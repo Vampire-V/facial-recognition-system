@@ -1,0 +1,413 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <script src="js/signalr.min.js"></script>
+    <script src="faceapi/face-api.js"></script>
+    <script src="js/commons.js"></script>
+    <script src="js/faceDetectionControls.js"></script>
+    <link rel="stylesheet" href="css/styles.css">
+    <link rel="stylesheet" href="css/bootstrap.min.css">
+    <script src="js/bootstrap.bundle.min.js"></script>
+</head>
+
+<body>
+    <div id="loader"></div>
+    <nav class="navbar bg-light">
+        <div class="container-fluid">
+            <a class="navbar-brand" href="#">
+                <img src="/haier.svg" alt="" width="100" height="30" class="d-inline-block align-text-top">
+                <!-- Bootstrap -->
+            </a>
+        </div>
+    </nav>
+    <div class="container-fluid">
+        <div class="row">
+            <div class="col">
+                <div style="position: relative" class="embed-responsive embed-responsive-16by9">
+                    <video onloadstart="onPlay(this)" id="inputVideo" autoplay muted playsinline
+                        style="position: absolute" class="embed-responsive-item"></video>
+                    <canvas id="overlay" style="position: absolute" class="embed-responsive-item"></canvas>
+                </div>
+
+            </div>
+            <div class="col">
+                <div>
+                    <label for="time">Caremra:</label>
+                    <select id="devices" onchange="switchCamera(this)"></select>
+                    <label for="time">Model:</label>
+                    <select id="selectFaceDetector">
+                        <option value="tiny_face_detector">tiny_face_detector</option>
+                        <option value="ssd_mobilenetv1">ssd_mobilenetv1</option>
+                    </select>
+                </div>
+                <div>
+                    <label for="time">Time:</label><span id="time">0</span>
+                    <label for="fps">Fps:</label><span id="fps">0</span>
+                </div>
+                <table class="table" id="table">
+                    <thead>
+                        <tr>
+                            <th scope="col">Employee No</th>
+                            <th scope="col">Name</th>
+                            <th scope="col">Time</th>
+                        </tr>
+                    </thead>
+                    <tbody id="list">
+                    </tbody>
+                </table>
+            </div>
+        </div>
+    </div>
+    <script src="js/bootstrap.min.js"></script>
+</body>
+
+<script>
+    'use strict'
+    let forwardTimes = []
+    let faceMatcher = null
+    // var LabeledFace = [] //staff label 
+    let frameHistory = [] //staff เอาไว้ตรวจสอบ 10 Frame
+    let employeeList = []
+    let verifiedList = [] //staff ที่ scan แล้ว
+    let currentStream;
+    const options = getFaceDetectorOptions()
+
+    function updateTimeStats(timeInMs) {
+        forwardTimes = [timeInMs].concat(forwardTimes).slice(0, 30)
+        const avgTimeInMs = forwardTimes.reduce((total, t) => total + t) / forwardTimes.length
+        document.querySelector("#time").textContent = `${Math.round(avgTimeInMs)} ms`
+        document.querySelector("#fps").textContent = `${faceapi.utils.round(1000 / avgTimeInMs)}`
+    }
+
+    // fetch first image of each class and compute their descriptors
+    async function createLabeleFaceMatcher(items) {
+        const labeled = await items.map(item => {
+            const descriptors = []
+            for (let index = 0; index < item.employeeImage.length; index++) {
+                const element = item.employeeImage[index];
+                let desToArr = Object.values(JSON.parse(element.descriptor))
+                let desToFormat = new Float32Array(desToArr)
+                descriptors.push(desToFormat)
+            }
+            return new faceapi.LabeledFaceDescriptors(item.name, descriptors)
+        })
+        return new faceapi.FaceMatcher(labeled)
+    }
+
+    function updateResults() {
+        console.log('update result....');
+    }
+
+    function renderStaffScan(staff, datetime) {
+        // add to local storage
+        const tbodieEl = document.querySelector("#list");
+        let row = tbodieEl.insertRow(0)
+        let empNo = row.insertCell(0)
+        let name = row.insertCell(1)
+        let time = row.insertCell(2)
+        empNo.appendChild(document.createTextNode(staff.id));
+        name.appendChild(document.createTextNode(staff.name));
+        time.appendChild(document.createTextNode(datetime));
+        if (tbodieEl.rows.length > 100) {
+            tbodieEl.deleteRow(tbodieEl.rows.length - 1)
+        }
+    }
+
+    function stopMediaTracks(stream) {
+        stream.getTracks().forEach(track => {
+            track.stop();
+        });
+    }
+
+    function removeVerifiedList() {
+        let indexOver = []
+        verifiedList.forEach((item, index) => {
+            if (isOvertime(new Date(item.datetime))) {
+                indexOver.unshift(index)
+            }
+        })
+        let countA = indexOver.length
+        if (countA > 0) {
+            for (var i = indexOver.length - 1; i >= 0; i--)
+                verifiedList.splice(indexOver[i], 1)
+        }
+    }
+
+    function isOvertime(datetime) {
+        if (!datetime) {
+            return true
+        }
+        let date_now = new Date()
+        // get total seconds between the times
+        let delta = Math.abs(date_now.getTime() - datetime.getTime()) / 1000;
+        // calculate (and subtract) whole days
+        let days = Math.floor(delta / 86400);
+        delta -= days * 86400;
+
+        // calculate (and subtract) whole hours
+        let hours = Math.floor(delta / 3600) % 24;
+        delta -= hours * 3600;
+
+        // calculate (and subtract) whole minutes
+        let minutes = Math.floor(delta / 60) % 60;
+        delta -= minutes * 60;
+
+        if (days >= 0 && hours >= 0 && minutes >= 10 && date_now.getTime() > datetime.getTime()) {
+            return true
+        } else {
+            return false
+        }
+    }
+
+    function landmarkDetect(landmarks, name) {
+        const landmarkPositions = landmarks.positions
+
+        // or get the positions of individual contours,
+        // only available for 68 point face ladnamrks (FaceLandmarks68)
+        const jawOutline = landmarks.getJawOutline()
+        const nose = landmarks.getNose()
+        const mouth = landmarks.getMouth()
+        const leftEye = landmarks.getLeftEye()
+        const rightEye = landmarks.getRightEye()
+        const leftEyeBbrow = landmarks.getLeftEyeBrow()
+        const rightEyeBrow = landmarks.getRightEyeBrow()
+        const obj = { name, landmarkPositions, jawOutline, nose, mouth, leftEye, rightEye, leftEyeBbrow, rightEyeBrow }
+        // console.table(obj)
+    }
+
+    function streamVideo(id = null) {
+
+        const videoEl = document.querySelector("#inputVideo");
+        const videoConstraints = {};
+        if (id) {
+            videoConstraints.deviceId = { exact: id };
+            videoConstraints.facingMode = { ideal: "environment" }
+        }
+
+        // videoConstraints.facingMode = { exact: "enviroment" };
+        const constraints = {
+            audio: false,
+            video: videoConstraints
+        }
+        if (navigator.mediaDevices.getUserMedia) {
+            navigator.mediaDevices.getUserMedia(constraints)
+                .then((stream) => {
+                    videoEl.srcObject = stream;
+                })
+                .catch((err) => {
+                    console.error(err); /* handle the error */
+                    if (err.name == "NotFoundError" || err.name == "DevicesNotFoundError") {
+                        //required track is missing 
+                        console.error("required track is missing");
+                    } else if (err.name == "NotReadableError" || err.name == "TrackStartError") {
+                        //webcam or mic are already in use 
+                        console.error("webcam or mic are already in use ");
+                    } else if (err.name == "OverconstrainedError" || err.name == "ConstraintNotSatisfiedError") {
+                        //constraints can not be satisfied by avb. devices 
+                        console.error("constraints can not be satisfied by avb. devices");
+                    } else if (err.name == "NotAllowedError" || err.name == "PermissionDeniedError") {
+                        //permission denied in browser 
+                        console.error("permission denied in browser");
+                    } else if (err.name == "TypeError" || err.name == "TypeError") {
+                        //empty constraints object 
+                        console.error("empty constraints object");
+                    } else {
+                        //other errors 
+                        console.error("other errors");
+                    }
+                });
+        }
+    }
+
+    function switchCamera(ele) {
+        if (typeof currentStream !== 'undefined') {
+            stopMediaTracks(currentStream);
+        }
+        streamVideo(ele.value)
+    }
+
+    async function run() {
+        try {
+            await startSignalR()
+            // load face detection and face expression recognition models
+            await changeFaceDetector(SSD_MOBILENETV1)
+            // await changeFaceDetector(TINY_FACE_DETECTOR)
+            // await getCurrentFaceDetectionNet().load(PATH_MODEL)
+            await faceapi.loadFaceLandmarkModel(PATH_MODEL)
+            await faceapi.loadFaceRecognitionModel(PATH_MODEL)
+            // await faceapi.loadFaceExpressionModel(PATH_MODEL)
+            let response = await getApi(`${BASE_URL}Employee/GetStaffForScan`)
+            if (!response.ok) {
+                const message = 'Error with Status Code: ' + response.status;
+                throw new Error(message);
+                console.error(message);
+            }
+            const data = await response.json();
+            employeeList = data
+            faceMatcher = await createLabeleFaceMatcher(data).then(res => new faceapi.FaceMatcher(res.labeledDescriptors))
+        } catch (error) {
+            console.error(error);
+            alert('load model fail...')
+            throw error
+        }
+        finally {
+            if (faceMatcher) {
+                streamVideo()
+            }
+        }
+
+    }
+
+    async function onPlay() {
+        const videoEl = document.querySelector("#inputVideo")
+        if (videoEl.paused || videoEl.ended || !isFaceDetectionModelLoaded()) {
+            return setTimeout(() => onPlay())
+        }
+
+        const canvas = document.querySelector("#overlay")
+        const ts = Date.now()
+        const result = await faceapi.detectAllFaces(videoEl, options).withFaceLandmarks().withFaceDescriptors()
+        const dimensions = faceapi.matchDimensions(canvas, videoEl, true)
+        updateTimeStats(Date.now() - ts)
+        document.querySelector("#loader").style.display = "none"
+        removeVerifiedList() // verifiedList หาเวลาของแต่ละหน้า หากหน้าไหนเกิน 10 นาที ให้นำ index นั้นออกไป
+        if (result) {
+            const resizedResult = faceapi.resizeResults(result, dimensions)
+            let detectPerFrame = []
+            resizedResult.forEach(({ detection, descriptor, landmarks }) => {
+                const label = faceMatcher.findBestMatch(descriptor).toString()
+                const name = `${label.slice(0, label.indexOf(" ("))}`
+                const isVerified = verifiedList.some(e => e.name === name)
+                const confirmFace = faceFocus(frameHistory, name)
+                let datetime = formatDate(new Date())
+                // landmarkDetect(landmarks, name)
+
+                let boxColor = isVerified ? COLOR_GREEN : COLOR_RED
+                let person = { name, datetime, boxColor }
+                detectPerFrame.push(person)
+                if (confirmFace && !isVerified) {
+                    let staff = employeeList.find(value => value.name === name)
+                    let form = {
+                        employeeNo: staff.id,
+                        transactionTime: datetime
+                    }
+                    // verified แต่ยังไม่เป็น COLOR_GREEN จนกว่า Server จะส่งค่ากลับมายืนยัน
+                    let result = postApi(`${BASE_URL}Employee/PostScanInOutWork`, JSON.stringify(form), { "Content-Type": 'application/json' })
+                    person.boxColor = COLOR_GREEN
+                    verifiedList.unshift(person)
+                    renderStaffScan(staff, datetime)
+                }
+
+                const options = { label }
+                options.boxColor = person.boxColor
+                const drawBox = new faceapi.draw.DrawBox(detection.box, options)
+                drawBox.draw(canvas)
+            })
+            // faceapi.draw.drawLandmarks(canvas, resizedResult, { drawLines: true })
+            // faceapi.draw.drawFaceLandmarks(canvas, resizedResult)
+            frameHistory.unshift(detectPerFrame)
+            if (frameHistory.length > 10) {
+                frameHistory.pop()
+            }
+        }
+        setTimeout(() => onPlay())
+    }
+
+    document.addEventListener('readystatechange', () => console.log('readyState:' + document.readyState))
+    window.addEventListener('DOMContentLoaded', () => {
+        console.log('DOMContentLoaded....');
+        // console.log(navigator);
+        navigator.mediaDevices.enumerateDevices().then(devices => {
+            const select = document.querySelector('#devices');
+            devices.forEach((device, index) => {
+                if (device.kind === 'videoinput') {
+                    const option = document.createElement('option');
+                    option.value = device.deviceId;
+                    const label = device.label || `Camera ${index++}`;
+                    const textNode = document.createTextNode(label);
+                    option.appendChild(textNode);
+                    select.appendChild(option);
+                }
+            });
+        }).catch(err => {
+            alert(JSON.stringify(err))
+        })
+
+        // renderNavBar('#navbar', 'example_face_recognition.html')
+        // console.log('renderNavBar');
+
+
+    });
+
+    window.onload = () => {
+        initFaceDetectionControls()
+        run()
+        // console.log(verifiedList);
+    }
+
+    // connection hub signalR
+    // let connection = new signalR.HubConnectionBuilder().withUrl(BASE_HUB).build()
+
+    // on ReceiveMessage message.
+    connection.on("ReceiveStaffUpdated", async employeeNo => {
+        let url = new URL(`${BASE_URL}Employee/Filter`)
+        if (employeeNo) {
+            url.searchParams.append("IdStaff", employeeNo)
+        }
+        try {
+            let response = await getApi(url)
+            if (!response.ok) {
+                const message = 'Error with Status Code: ' + response.status
+                throw new Error(message)
+                console.error(message)
+            }
+            const data = await response.json();
+            employeeList.push(data[0])
+            let s = await createLabeleFaceMatcher(data).then(res => new faceapi.FaceMatcher(res.labeledDescriptors))
+            s._labeledDescriptors.forEach(item => {
+                faceMatcher._labeledDescriptors.push(item)
+            })
+
+            // employeeList = data
+        } catch (err) {
+            console.error(err)
+        }
+
+
+
+        const options = {
+            body: 'Do you like my body?',
+            silent: false,
+            icon: '/images/suchart/suchart1.jpg',
+            sound: '/images/mixkit-doorbell-single-press-333.wav'
+        }
+        if (!("Notification" in window)) {
+            // Check if the browser supports notifications
+            alert("This browser does not support desktop notification");
+        } else if (Notification.permission === "granted") {
+            // Check whether notification permissions have already been granted;
+            // if so, create a notification
+            const notification = new Notification("Hi there!", options);
+            console.log("granted", notification);
+            // …
+        } else if (Notification.permission !== "denied") {
+            // We need to ask the user for permission
+            Notification.requestPermission().then((permission) => {
+                // If the user accepts, let's create a notification
+                if (permission === "granted") {
+                    const notification = new Notification("Hi there!", options);
+                    // …
+                    console.log("denied", notification);
+                }
+            });
+        }
+        // alert(`${user} ${message}`)
+    });
+
+    // connection.start().then(() => console.log('online hub')).catch(err => console.error(err.toString()))
+</script>
+</body>
+
+</html>
